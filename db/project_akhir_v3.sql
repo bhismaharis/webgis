@@ -413,31 +413,17 @@ DROP TABLE IF EXISTS temp_tps;
 -- 1. Function untuk generate grid points dalam polygon
 CREATE OR REPLACE FUNCTION sampah.generate_grid_points(
     geom geometry,
-    grid_spacing decimal  -- Jarak antar titik dalam meter
+    grid_spacing decimal
 ) RETURNS TABLE (
     point_geom geometry(Point, 4326)
 ) AS $$
 BEGIN
     RETURN QUERY
-    WITH bounds AS (
-        SELECT ST_Envelope(geom) as box
-    ),
-    grid AS (
-        SELECT ST_SetSRID(
-            ST_MakePoint(
-                ST_X(ST_StartPoint(bounds.box)) + (grid_x * (grid_spacing / 111111.0)),
-                ST_Y(ST_StartPoint(bounds.box)) + (grid_y * (grid_spacing / 111111.0))
-            ),
-            4326
-        ) AS point
-        FROM bounds,
-        generate_series(0, ceil((ST_XMax(bounds.box) - ST_XMin(bounds.box)) / (grid_spacing / 111111.0))::integer) as grid_x,
-        generate_series(0, ceil((ST_YMax(bounds.box) - ST_YMin(bounds.box)) / (grid_spacing / 111111.0))::integer) as grid_y
-    )
-    -- Filter hanya points yang berada dalam polygon
-    SELECT point::geometry(Point, 4326)
-    FROM grid
-    WHERE ST_Contains(geom, point);
+    SELECT 
+        (ST_Dump(ST_GeneratePoints(
+            geom, 
+            (ST_Area(geom::geography) / (grid_spacing * grid_spacing))::integer
+        ))).geom::geometry(Point, 4326);
 END;
 $$ LANGUAGE plpgsql;
 
@@ -449,12 +435,12 @@ CREATE OR REPLACE FUNCTION sampah.hitung_metrics_point(
     jarak_ke_jalan numeric,
     jarak_ke_tps_terdekat numeric,
     jarak_ke_pemukiman numeric,
-    tps_dalam_radius integer
+    tps_dalam_radius integer,
+    dalam_radius_tps boolean
 ) AS $$
 BEGIN
     RETURN QUERY
     WITH area_pemukiman AS (
-        -- Hitung area pemukiman dengan mengurangkan lahan potensial dari kelurahan
         SELECT k.id, 
             ST_Boundary(
                 ST_Difference(
@@ -467,14 +453,26 @@ BEGIN
         WHERE ST_Contains(k.geom, point_geom)
         GROUP BY k.id, k.geom
     ),
-    jarak_metrics AS (
+    tps_existing_radius AS (
+        SELECT EXISTS (
+            SELECT 1 
+            FROM sampah.tps t
+            WHERE t.status = 'AKTIF' 
+            AND (
+                (t.golongan = 'TIPE_I' AND ST_DWithin(point_geom::geography, t.geom::geography, 250)) OR
+                (t.golongan = 'TIPE_II' AND ST_DWithin(point_geom::geography, t.geom::geography, 500)) OR
+                (t.golongan = 'TIPE_III' AND ST_DWithin(point_geom::geography, t.geom::geography, 1000))
+            )
+        ) as is_within_radius
+    ),
+    metrics AS (
         SELECT 
             -- Jarak ke jalan terdekat
             COALESCE(
                 (
                     SELECT MIN(ST_Distance(point_geom::geography, j.geom::geography))::numeric
                     FROM sampah.jalan j
-                    WHERE j.tipe IN ('primary', 'secondary', 'tertiary')
+                    -- WHERE j.tipe IN ('primary', 'secondary', 'tertiary')
                 ),
                 0::numeric
             ) as jarak_jalan,
@@ -504,11 +502,13 @@ BEGIN
             ) as count_tps
     )
     SELECT 
-        jarak_jalan,
-        jarak_tps,
-        jarak_pemukiman,
-        count_tps
-    FROM jarak_metrics;
+        m.jarak_jalan,
+        m.jarak_tps,
+        m.jarak_pemukiman,
+        m.count_tps,
+        NOT r.is_within_radius as outside_radius
+    FROM metrics m
+    CROSS JOIN tps_existing_radius r;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -603,11 +603,13 @@ BEGIN
         WHERE lp.status = 'KOSONG'
         AND lp.luas >= p_min_luas
         AND (p_kelurahan_id IS NULL OR lp.kelurahan_id = p_kelurahan_id)
+        AND metrics.dalam_radius_tps = false -- Only select points outside TPS service radius
     ),
     analyzed_points AS (
+        -- Rest of the analysis remains the same...
         SELECT 
             pp.*,
-            -- Penentuan golongan
+            -- Penentuan golongan sesuai dengan kriteria yang ada
             CASE
                 WHEN pp.luas_lahan >= 200 AND pp.kepadatan_penduduk >= 100 THEN 'TIPE_III'::sampah.golongan_tps
                 WHEN pp.luas_lahan >= 60 AND pp.kepadatan_penduduk >= 50 THEN 'TIPE_II'::sampah.golongan_tps
@@ -880,6 +882,8 @@ SELECT * FROM sampah.analisis_rekomendasi_tps_baru(
 SELECT sampah.simpan_rekomendasi_tps(
     p_grid_spacing := 50
 );
+
+SELECT sampah.simpan_rekomendasi_tps();
 
 -- 3. Analisis untuk kelurahan tertentu
 SELECT * FROM sampah.analisis_rekomendasi_tps_baru(
