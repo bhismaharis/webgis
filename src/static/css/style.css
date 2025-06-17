@@ -1,1 +1,9 @@
-/* This file is intentionally left blank. */
+#map {
+    height: 100vh;
+    width: 100%;
+}
+
+body {
+    margin: 0;
+    padding: 0;
+}

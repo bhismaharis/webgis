@@ -603,7 +603,7 @@ BEGIN
         WHERE lp.status = 'KOSONG'
         AND lp.luas >= p_min_luas
         AND (p_kelurahan_id IS NULL OR lp.kelurahan_id = p_kelurahan_id)
-        AND metrics.dalam_radius_tps = false -- Only select points outside TPS service radius
+        AND metrics.dalam_radius_tps = true
     ),
     analyzed_points AS (
         -- Rest of the analysis remains the same...
@@ -647,35 +647,68 @@ BEGIN
             ) as skor_kelayakan
         FROM potential_points pp
         WHERE pp.jarak_ke_jalan <= p_jarak_maksimal_jalan
-    )
+    ),
+        filtered_points AS (
+            -- Filter titik berdasarkan jarak minimum antar rekomendasi
+            SELECT DISTINCT ON (ap.kelurahan_nama) ap.*
+            FROM analyzed_points ap
+            WHERE NOT EXISTS (
+                -- Cek jarak dengan titik rekomendasi yang sudah terpilih
+                SELECT 1
+                FROM analyzed_points ap2
+                WHERE ap.lahan_id != ap2.lahan_id
+                AND (
+                    -- Pastikan jarak minimum antar rekomendasi berdasarkan tipe
+                    CASE 
+                        WHEN ap.golongan_rekomendasi = 'TIPE_III' THEN 
+                            ST_DWithin(ap.geom::geography, ap2.geom::geography, 1000)
+                        WHEN ap.golongan_rekomendasi = 'TIPE_II' THEN 
+                            ST_DWithin(ap.geom::geography, ap2.geom::geography, 500)
+                        ELSE 
+                            ST_DWithin(ap.geom::geography, ap2.geom::geography, 250)
+                    END
+                )
+            )
+            -- Pastikan di luar radius TPS existing
+            AND NOT EXISTS (
+                SELECT 1 
+                FROM sampah.tps t
+                WHERE t.status = 'AKTIF'
+                AND ST_DWithin(ap.geom::geography, t.geom::geography, 1000)
+            )
+            ORDER BY 
+                ap.kelurahan_nama,
+                ap.skor_kelayakan DESC,
+                ap.jarak_ke_jalan ASC
+        )
     SELECT 
-        ap.lahan_id,
-        ap.point_id,
-        ap.kelurahan_nama,
-        ROUND(ap.luas_lahan::NUMERIC, 2),
-        ROUND(ap.kepadatan_penduduk::NUMERIC, 2),
-        ROUND(ap.jarak_ke_jalan::NUMERIC, 2),
-        ROUND(ap.jarak_ke_tps_terdekat::NUMERIC, 2),
-        ROUND(ap.jarak_ke_pemukiman::NUMERIC, 2),
-        ap.tps_dalam_radius,
-        ap.golongan_rekomendasi,
-        ap.estimasi_kapasitas_jiwa,
-        ROUND(ap.estimasi_volume::NUMERIC, 2),
-        ROUND(ap.estimasi_luas_minimal::NUMERIC, 2),
-        ROUND(ap.skor_kelayakan::NUMERIC, 2),
+        fp.lahan_id,
+        fp.point_id,
+        fp.kelurahan_nama,
+        fp.luas_lahan::NUMERIC,
+        fp.kepadatan_penduduk::NUMERIC,
+        fp.jarak_ke_jalan::NUMERIC,
+        fp.jarak_ke_tps_terdekat::NUMERIC,
+        fp.jarak_ke_pemukiman::NUMERIC,
+        fp.tps_dalam_radius,
+        fp.golongan_rekomendasi,
+        fp.estimasi_kapasitas_jiwa,
+        fp.estimasi_volume::NUMERIC,
+        fp.estimasi_luas_minimal::NUMERIC,
+        fp.skor_kelayakan::NUMERIC,
         ROW_NUMBER() OVER (
-            PARTITION BY ap.kelurahan_nama 
-            ORDER BY ap.skor_kelayakan DESC, ap.jarak_ke_jalan ASC
+            PARTITION BY fp.kelurahan_nama 
+            ORDER BY fp.skor_kelayakan DESC, fp.jarak_ke_jalan ASC
         )::INTEGER as prioritas,
         CASE
-            WHEN ap.skor_kelayakan >= 80 THEN 'Sangat Direkomendasikan'
-            WHEN ap.skor_kelayakan >= 60 THEN 'Direkomendasikan'
+            WHEN fp.skor_kelayakan >= 80 THEN 'Sangat Direkomendasikan'
+            WHEN fp.skor_kelayakan >= 60 THEN 'Direkomendasikan'
             ELSE 'Tidak Direkomendasikan'
         END as status_rekomendasi,
-        ap.geom
-    FROM analyzed_points ap
-    WHERE ap.golongan_rekomendasi IS NOT NULL
-    ORDER BY ap.skor_kelayakan DESC, ap.kelurahan_nama, ap.point_id;
+        fp.geom
+    FROM filtered_points fp
+    WHERE fp.golongan_rekomendasi IS NOT NULL
+    ORDER BY fp.skor_kelayakan DESC, fp.kelurahan_nama, fp.point_id;
 END;
 $$ LANGUAGE plpgsql;
 
