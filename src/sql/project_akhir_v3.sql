@@ -801,6 +801,72 @@ $$ LANGUAGE plpgsql;
 -- 2. FUNCTION REKOMENDASI PENINGKATAN GOLONGAN TPS
 -- ========================================
 
+CREATE OR REPLACE FUNCTION sampah.rekomendasi_peningkatan_tps_dengan_lahan()
+RETURNS TABLE (
+    kelurahan_id INTEGER,
+    kelurahan_nama VARCHAR,Add commentMore actions
+    tps_id INTEGER,
+    tps_nama VARCHAR,
+    golongan_tps VARCHAR,
+    kapasitas_jiwa INTEGER,
+    rekomendasi TEXT,
+    lahan_terdekat BOOLEAN
+) AS $$
+DECLARE
+    kelurahan RECORD;
+    tps RECORD;
+    lahan_terdekat BOOLEAN;
+BEGIN
+    -- Loop untuk setiap kelurahan
+    FOR kelurahan IN
+        SELECT k.id AS kelurahan_id, k.nama AS kelurahan_nama
+        FROM sampah.kelurahan k
+    LOOP
+        -- Loop untuk setiap TPS di kelurahan
+        FOR tps IN
+            SELECT t.id AS tps_id, t.nama AS tps_nama, t.golongan::VARCHAR AS golongan_tps, t.kapasitas_jiwa, t.geom
+            FROM sampah.tps t
+            WHERE t.kelurahan_id = kelurahan.kelurahan_id AND t.status = 'AKTIF'
+        LOOP
+            -- Cek apakah kapasitas TPS mencukupi
+            IF tps.kapasitas_jiwa < (
+                SELECT k.jumlah_penduduk
+                FROM sampah.kelurahan k
+                WHERE k.id = kelurahan.kelurahan_id
+            ) THEN
+                -- Cek apakah ada lahan kosong di sekitar TPS
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM sampah.lahan_potensial lp
+                    WHERE lp.status = 'KOSONG'
+                    AND ST_DWithin(tps.geom::geography, lp.geom::geography, 500)
+                ) INTO lahan_terdekat;
+
+                -- Berikan rekomendasi peningkatan
+                RETURN QUERY SELECT 
+                    kelurahan.kelurahan_id,
+                    kelurahan.kelurahan_nama,
+                    tps.tps_id,
+                    tps.tps_nama,
+                    tps.golongan_tps,
+                    tps.kapasitas_jiwa,
+                    CASE
+                        WHEN tps.golongan_tps = 'TIPE_I' THEN 'Direkomendasikan untuk naik ke TIPE_II'
+                        WHEN tps.golongan_tps = 'TIPE_II' THEN 'Direkomendasikan untuk naik ke TIPE_III'
+                        ELSE 'Tidak ada rekomendasi peningkatan'
+                    END,
+                    lahan_terdekat;
+            END IF;
+        END LOOP;
+    END LOOP;
+END;
+$$ LANGUAGE plpgsql;
+SELECT * FROM sampah.rekomendasi_peningkatan_tps_dengan_lahan();
+
+-- ========================================
+-- FUNCTION JALUR EFEKTIF PENGANGKUTAN
+-- ========================================
+
 -- -- Function untuk mencari rute berdasarkan hierarki jalan
 -- CREATE OR REPLACE FUNCTION sampah.cari_rute_tps_ke_tpa(
 --     p_tps_geom geometry,
@@ -997,9 +1063,7 @@ $$ LANGUAGE plpgsql;
 --     END LOOP;
 -- END;
 -- $$ LANGUAGE plpgsql;
--- ========================================
--- FUNCTION JALUR EFEKTIF PENGANGKUTAN
--- ========================================
+
 
 -- Function untuk mencari jalan terdekat dari titik
 -- CREATE OR REPLACE FUNCTION sampah.cari_jalan_terdekat(
